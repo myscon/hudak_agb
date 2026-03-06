@@ -1,0 +1,7 @@
+[project]
+name = "cms_agb"
+version = "0.0.0"
+description = "cms_agb"
+
+[tool.setuptools.packages]
+find = {where = ["src"]}
