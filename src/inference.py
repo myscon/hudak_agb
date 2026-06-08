@@ -11,20 +11,15 @@ from rasterio.windows import from_bounds
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from download import  DIRS_YEARS, DATA_DIR, IMAGERY_DIR, PRISM_RPR_DIR, SOLUS_DIR, STAT_PATH, PRISM_ELEMENTS, PRISM_YEARS, CHIP_SIZE, PIXEL_SIZE, EPSG_CODE
-from train import DEVICE, DTYPE, SDTYPE, PATCH_SIZE, L_SIZE, NO_DATA, TOUT_DIR, AttnSETRPUP, PRISM_FILES, SOLUS_FILES, L_SIZE, NO_DATA
+from constants import IMAGERY_DIR, PRISM_RPR_DIR, PRISM_FILES, SOLUS_DIR, SOLUS_FILES, STAT_PATH
+from constants import DIRS_YEARS, PRISM_ELEMENTS, PRISM_YEARS
+from constants import TRAIN_OUT_DIR
+from constants import CHIP_SIZE, DEVICE, DTYPE, EPSG_CODE, L_SIZE, NO_DATA, INF_NO_DATA, PATCH_SIZE, PIXEL_SIZE
+from constants import PLOT_GRID, FISHNET_GRID, CLIP_GRID
+from constants import CLIP_SIZE, NUM_JITTERS, BATCH_SIZE
+
+from train import PrithviUPerNet, AttnSETRPUP
 from utils import read_window, crop_and_pad, cache_anc
-
-
-PLOT_GRID = DATA_DIR / 'hudak_agb_grid_buff.geojson'
-FISHNET_GRID = DATA_DIR / 'hudak_agb_grid.geojson'
-CLIP_GRID = DATA_DIR / 'hudak_agb_grid_clip.geojson'
-
-GRID_SIZE = PIXEL_SIZE * CHIP_SIZE
-CLIP_SIZE = GRID_SIZE // 4
-NUM_JITTERS = 64
-BATCH_SIZE = 64
-AUXP_MAP = {f"PRISM_{e.upper()}_AUXP": f"PRISM_{e.upper()}" for e in PRISM_ELEMENTS}
 
 
 class GridUnitInfDataset(Dataset):
@@ -63,7 +58,7 @@ class GridUnitInfDataset(Dataset):
         if self.ablate == "SOLUS100":
             out["SOLUS100"] = torch.normal(mean=self.stat[f"MEANS_SOLUS100"].expand(-1, L_SIZE, L_SIZE), std=self.stat[f"STDDV_SOLUS100"].expand(-1, L_SIZE, L_SIZE))
         else:
-            out["SOLUS100"] = crop_and_pad(self.solus_dat, col_off, row_off, L_SIZE, L_SIZE).clone().to(DTYPE)
+            out["SOLUS100"] = crop_and_pad(self.solus_dat, col_off, row_off, L_SIZE, L_SIZE).clone()
         
         ancp = []
         Y = int((grid_cell_year-PRISM_YEARS[0])*12)
@@ -71,7 +66,7 @@ class GridUnitInfDataset(Dataset):
         for e in PRISM_ELEMENTS:
             E = e.upper()
             pname = f"PRISM_{E}"
-            prism = crop_and_pad(self.prism_dat[E], col_off, row_off, L_SIZE, L_SIZE).clone().to(DTYPE)
+            prism = crop_and_pad(self.prism_dat[E], col_off, row_off, L_SIZE, L_SIZE).clone()
             if self.ablate == pname or self.ablate == "PRISM":
                 out[pname] = torch.normal(mean=self.stat[f"MEANS_{pname}"].expand(360, L_SIZE, L_SIZE), std=self.stat[f"STDDV_{pname}"].expand(360, L_SIZE, L_SIZE))
                 ancp.append(torch.mean(prism[YM], dim=0, keepdim=True))
@@ -128,14 +123,17 @@ class GridUnitInfDataset(Dataset):
         return out
 
 
-def chip_writer(queue, file_path, grid, years, profile, clip=None, jitter=None):
-    file_refs = {y: rasterio.open(file_path/f"{y}.tif", 'w', **profile) for y in years}
-
+def chip_writer(queue, file_path, grid, years, profile, clip=None, jitter=None, count=False):
+    file_refs = {y: rasterio.open(file_path/f"{y}.tif", 'w+', **profile) for y in years}
+    if count:
+        file_refs_c = {y: rasterio.open(file_path/f"{y}_c.tif", 'w+', **profile) for y in years}
+        
     while True:
         payload = queue.get()
         if payload is None:
             break
         idxes, years, preds = payload
+        preds = preds.astype(np.uint16)
         for i in range(years.shape[0]):
             year = years[i].item()
             idx = idxes[i].item()
@@ -150,13 +148,19 @@ def chip_writer(queue, file_path, grid, years, profile, clip=None, jitter=None):
                     xmax - clip,
                     ymax - clip
                 )
-            win = from_bounds(xmin, ymin, xmax, ymax, file_refs[year].transform)
             try:
-                file_refs[year].write(preds[i], window=win)
+                win = from_bounds(xmin, ymin, xmax, ymax, file_refs[year].transform)
+                arr = file_refs[year].read(window=win)
+                arr = np.where(arr == INF_NO_DATA, 0, arr)
+                arr += preds[i]
+                file_refs[year].write(arr, window=win)
+                if count:
+                    win = from_bounds(xmin, ymin, xmax, ymax, file_refs_c[year].transform)
+                    arr_c = file_refs_c[year].read(window=win)
+                    arr_c = np.where(arr_c == INF_NO_DATA, 0, arr_c)
+                    file_refs_c[year].write(arr_c+np.uint16(1), window=win)
             except Exception as e:
                 print(f"Error writing chip at index {idx} for year {year} win {win} bounds {(xmin, ymin, xmax, ymax)}: {e}")
-    for f in file_refs.values():
-        f.close()
 
 
 def proc_sample(samples, stats, kwargs):
@@ -165,40 +169,39 @@ def proc_sample(samples, stats, kwargs):
         if k != "YEAR" and k != "GRID_IDX":
             sample = sample.to(DEVICE, DTYPE)
             if 'LS' in k and kwargs['norm']:
-                means = stats[f"MEANS_PRITHVI"].to(DEVICE)
-                stddv = stats[f"STDDV_PRITHVI"].to(DEVICE)
+                means = stats[f"MEANS_PRITHVI"]
+                stddv = stats[f"STDDV_PRITHVI"]
                 sample = (sample - means) / stddv
             elif k == 'PRISM__':
                     for i, p in enumerate(PRISM_ELEMENTS):
                         P = p.upper()
-                        means = stats[f"MEANS_PRISM_{P}"].to(DEVICE)
-                        stddv = stats[f"STDDV_PRISM_{P}"].to(DEVICE)
+                        means = stats[f"MEANS_PRISM_{P}"]
+                        stddv = stats[f"STDDV_PRISM_{P}"]
                         sample[:,i:i+1] = (sample[:,i:i+1] - means) / stddv
             else:
-                means = stats[f"MEANS_{k}"].to(DEVICE)
-                stddv = stats[f"STDDV_{k}"].to(DEVICE)
+                means = stats[f"MEANS_{k}"]
+                stddv = stats[f"STDDV_{k}"]
                 sample = (sample - means) / stddv
             sample[torch.isnan(sample)] = NO_DATA  
         procs[k] = sample
     return procs
 
 
-def run_inference(dataset, model, model_kwargs, stats, profile, out_dir, name):
-    if dataset.jittered is not None:
-        profile.update({"transform": dataset.jittered * profile["transform"]})
+def run_inference(dataset, model, model_kwargs, stats, profile, out_dir, name, clip, count):
     out_path = out_dir / name
     out_path.mkdir(exist_ok=True)
     q = mp.Queue(maxsize=256)
 
-    if "clip" in dataset.grid_path.name:
+    if clip:
         slc = slice(CLIP_SIZE//PIXEL_SIZE, -CLIP_SIZE//PIXEL_SIZE)
-        clip = CLIP_SIZE
+        clip_val = CLIP_SIZE
     else:
         slc = slice(None)
-        clip = None
+        clip_val = None
+
     writer_proc = mp.Process(
         target=chip_writer,
-        args=(q, out_path, dataset.grid, dataset.years, profile, clip, dataset.jittered),
+        args=(q, out_path, dataset.grid, dataset.years, profile, clip_val, dataset.jittered, count),
     )
     writer_proc.start()
     inf_loader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=0)
@@ -208,8 +211,9 @@ def run_inference(dataset, model, model_kwargs, stats, profile, out_dir, name):
             procs = proc_sample(samples, stats, model_kwargs)
             with torch.autocast(device_type="cuda", dtype=DTYPE):
                 pred = model(procs)
+            pred[pred < 0] = 0
+            pred = pred.to(torch.uint16)
             q.put((procs['GRID_IDX'].cpu(), procs["YEAR"].cpu(), pred[:, :, slc, slc].cpu().numpy()))
-
     q.put(None)
     writer_proc.join()
 
@@ -220,22 +224,23 @@ def main(name, pattern):
     
     stats = {}
     for k, s in stat.items():
-        stats[k] = torch.tensor(s, dtype=DTYPE).view(-1, 1, 1)
+        stats[k] = torch.tensor(s, device=DEVICE, dtype=DTYPE).view(-1, 1, 1)
 
-    _CKPT_DIR = TOUT_DIR / name / "ckpt"
+    _CKPT_DIR = TRAIN_OUT_DIR / name / "ckpt"
     _CKPT_PATH = sorted(list(_CKPT_DIR.glob(f"{pattern}*.pt")))[0]
-    _OUT_DIR = TOUT_DIR / name / _CKPT_PATH.with_suffix("").name
+    _OUT_DIR = TRAIN_OUT_DIR / name / _CKPT_PATH.with_suffix("").name
     _OUT_DIR.mkdir(exist_ok=True, parents=True)
     
     ckpt = torch.load(_CKPT_PATH)
     
     # instantiating model and optimizers
-    model = AttnSETRPUP(**ckpt["model_kwargs"])
+    model = PrithviUPerNet(**ckpt["model_kwargs"])
+    # model = AttnSETRPUP(**ckpt["model_kwargs"])
     model.load_state_dict(ckpt["state_dict"])
-    model.to(DEVICE)
+    model.to(DEVICE, DTYPE)
     model.eval()
     
-    cache = cache_anc(IMAGERY_DIR, ckpt["model_kwargs"]['img'], DIRS_YEARS[ckpt["model_kwargs"]['img']], PATCH_SIZE, PRISM_ELEMENTS, PRISM_FILES, SOLUS_FILES, SDTYPE)
+    cache = cache_anc(IMAGERY_DIR, ckpt["model_kwargs"]['img'], DIRS_YEARS[ckpt["model_kwargs"]['img']], PATCH_SIZE, PRISM_ELEMENTS, PRISM_FILES, SOLUS_FILES, DTYPE)
     inf_dataset = GridUnitInfDataset(ckpt["model_kwargs"]['img'], ckpt["model_kwargs"]['dem'], stat=stats, cache=cache)
     transform = inf_dataset.patch_transform * Affine.scale(1/PATCH_SIZE, 1/PATCH_SIZE)
     profile = {
@@ -249,38 +254,36 @@ def main(name, pattern):
         'blockxsize': CHIP_SIZE,
         'blockysize': CHIP_SIZE,
         'crs': EPSG_CODE,
-        'nodata': NO_DATA,
+        'nodata': INF_NO_DATA,
         'compress': 'lzw',
-        'dtype': "float32"
+        'dtype': "uint16"
     }
-    
-    profile_ = copy.deepcopy(profile)
-    # run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile_, _OUT_DIR, f"inference")
-    
-    inf_dataset.set_ablate("PRISM")
-    run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile_, _OUT_DIR, f"rPRISM")
+    run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile, _OUT_DIR, f"no_overlap", False, False)
     
     # this could probably be parallelized but i will leave it
-    # profile_ = copy.deepcopy(profile)
-    # for ablate in ['NASADEM', 'SOLUS100', 'PRISM__', 'PRISM', *[f"PRISM_{p.upper()}" for p in PRISM_ELEMENTS]]:
-    #     inf_dataset.set_ablate(ablate)
-    #     run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile_, _OUT_DIR, f"r{ablate}")
+    for ablate in ['NASADEM', 'SOLUS100', 'PRISM__', 'PRISM', *[f"PRISM_{p.upper()}" for p in PRISM_ELEMENTS]]:
+        inf_dataset.set_ablate(ablate)
+        run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile, _OUT_DIR, f"ran_{ablate}", False, False)
     
+    # slide and avg
+    inf_dataset.set_grid(CLIP_GRID)
+    run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile, _OUT_DIR, f"slide_avg", False, True)
+    
+    # random jitter
     out_dir = _OUT_DIR / "jitters"
     out_dir.mkdir(exist_ok=True)
-    inf_dataset.set_grid(CLIP_GRID)
-    profile_ = copy.deepcopy(profile)
     for position in range(NUM_JITTERS):
         if position > 0:
             inf_dataset.jitter()
-        run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile_, out_dir, f"{position:04d}")
+            profile.update({"transform": inf_dataset.jittered * profile["transform"]})
+        run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile, out_dir, f"{position:04d}", True, False)
 
+    # # full inference
     # inf_dataset.set_grid(FISHNET_GRID)
-    # profile_ = copy.deepcopy(profile)
-    # run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile_, _OUT_DIR, "inference")
+    # run_inference(inf_dataset, model, ckpt["model_kwargs"], stats, profile, _OUT_DIR, "full_inference")
 
        
 if __name__ == "__main__":
-    name = "initial_attempt"
+    name = "upernet"
     pattern = "val_rmse_"
     main(name, pattern)

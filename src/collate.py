@@ -37,11 +37,12 @@ def process_year(year, jitter_paths, grid, profile, outpath):
             stack = np.stack(stack)
             mean = stack.mean(axis=0)
             var  = stack.var(axis=0)
+            std = stack.std(axis=0)
             try:
                 window = from_bounds(*bounds, transform=out_mean.transform)
                 out_mean.write(mean, window=window)
                 out_var.write(var, window=window)
-                out_cvar.write(var / (mean ), window=window)
+                out_cvar.write((var-mean) / std , window=window)
             except Exception as e:
                 continue
     finally:

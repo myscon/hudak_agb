@@ -70,7 +70,7 @@ def read_window(src_path, chip_bounds, indexes=None, out_shape=None, dtype=torch
         return dat
 
 
-def cache_anc(imagery_dir, source, years, patch_size, prism_elements, prism_files, solus_files, sdtype):
+def cache_anc(imagery_dir, source, years, patch_size, prism_elements, prism_files, solus_files, dtype):
     with rasterio.open(imagery_dir / f"{source}{years[0]}.tif") as src:
         col_max_pad = math.ceil(src.width / patch_size) * patch_size
         row_max_pad = math.ceil(src.height / patch_size) * patch_size
@@ -85,11 +85,11 @@ def cache_anc(imagery_dir, source, years, patch_size, prism_elements, prism_file
         E = e.upper()
         prism_dat[E] = []
         for f in tqdm(prism_files[e], desc=f"caching prism {E}"):
-            prism_dat[E].append(read_window(f, bounds, out_shape=_shw, dtype=sdtype))
+            prism_dat[E].append(read_window(f, bounds, out_shape=_shw, dtype=dtype))
         prism_dat[E] = torch.concat(prism_dat[E])
 
     solus_dat = []
     for f in tqdm(solus_files, desc=f"caching solus"):
-        solus_dat.append(read_window(f, bounds, out_shape=_shw, dtype=sdtype))
+        solus_dat.append(read_window(f, bounds, out_shape=_shw, dtype=dtype))
     solus_dat = torch.concat(solus_dat)
     return {"prism_dat": prism_dat, "solus_dat": solus_dat, "patch_transform": patch_transform, "height": row_max_pad, "width": col_max_pad}

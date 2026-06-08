@@ -1,6 +1,5 @@
 import geopandas as gpd
 import ee
-import datetime
 import numpy as np
 import os
 import rasterio
@@ -10,44 +9,18 @@ import yaml
 import zipfile
 
 from bs4 import BeautifulSoup
-from datetime import datetime
-from pathlib import Path
-from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 from rasterio.windows import from_bounds as win_from_bounds
 from rasterio.transform import from_bounds as tran_from_bounds
 from rasterio.io import MemoryFile
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from urllib.parse import urljoin
 
-
-EE_PROJECT = 'ee-myscon'
-PIXEL_SIZE = 30
-CHIP_SIZE = 224
-PARALLELLISM = 16
-EPSG_CODE = 'EPSG:5070'
-
-DATA_DIR = Path("data")
-IMAGERY_DIR = DATA_DIR / "pnw"
-PRISM_RPR_DIR = DATA_DIR / "prism_reprojected"
-PRISM_ZIP_DIR = DATA_DIR / "prism_monthly"
-SOLUS_DIR = DATA_DIR / "solus100"
-STAT_PATH = DATA_DIR / "stat.yml"
-
-SENSOR_DIRS = [DATA_DIR / 'LS', DATA_DIR / 'HLSL', DATA_DIR / 'HLSS', DATA_DIR / 'HLS', DATA_DIR / 'GLO30', DATA_DIR / 'NASADEM']
-SENSOR_YEARS = [range(2000, 2026), range(2013, 2026), range(2016, 2026), range(2016, 2026), None, None]    
-DIRS_YEARS = {p.name: y for p, y in zip(SENSOR_DIRS, SENSOR_YEARS)}
-PRISM_YEARS = list(range(1991, 2021))
-
-COMPOSITE_DATE_START = datetime(2000, 7, 15)
-COMPOSITE_DATE_END = datetime(2000, 8, 31)
-
-SCALE = .0001
-
-PRISM_ELEMENTS = ['ppt', 'tdmean', 'tmax', 'tmean', 'tmin', 'vpdmax', 'vpdmin']
-LBANDS = ["Fmask", "B2", "B3", "B4", "B5", "B6", "B7"]
-SBANDS = ["Fmask", "B2", "B3", "B4", "B8A", "B11", "B12"]
-BANDS = LBANDS[1:]
+from constants import EE_PROJECT, EPSG_CODE, CHIP_SIZE, PARALLELLISM, PIXEL_SIZE, SCALE
+from constants import FISHNET_GRID, IMAGERY_DIR, PRISM_RPR_DIR, PRISM_ZIP_DIR, SOLUS_DIR, STAT_PATH
+from constants import SENSOR_DIRS, SENSOR_YEARS, PRISM_ELEMENTS, PRISM_YEARS
+from constants import COMPOSITE_DATE_START, COMPOSITE_DATE_END, LBANDS, SBANDS, BANDS
 
 
 ee.Initialize(project=EE_PROJECT)
@@ -57,7 +30,11 @@ def get_ls_combined_sr_collection():
     lt5 = get_ls_sr_collection('LT05')
     le7 = get_ls_sr_collection('LE07')
     # SLC-OFF for Landsat 7 after 2003-05-31
-    le7 = le7.filter(ee.Filter.Or([ee.Filter.lte('system:time_start', 1054425600000), ee.Filter.gte('system:time_start', 1086048000000)]))
+    le7 = le7.filter(ee.Filter.And([
+        ee.Filter.Or([ee.Filter.lte('system:time_start', 1054425600000),
+                      ee.Filter.gte('system:time_start', 1336176000000)]),
+        ee.Filter.lte('system:time_start', 1363564800000)
+    ]))
     lc8 = get_ls_sr_collection('LC08')
     lc9 = get_ls_sr_collection('LC09')
     return lt5.merge(le7).merge(lc8).merge(lc9)
@@ -352,7 +329,7 @@ def main():
     process_prism()
 
     IMAGERY_DIR.mkdir(exist_ok=True)
-    grid = gpd.read_file("hudak_agb_grid.geojson")
+    grid = gpd.read_file(FISHNET_GRID)
     stat = {}
     fuse_futures = []
 
@@ -364,6 +341,10 @@ def main():
     _NASADEM = ee.Image("NASA/NASADEM_HGT/001")
 
     IMAGERY = [_LS, _HLSL, _HLSS, _HLS, _GLO30, _NASADEM] 
+    
+    # IMAGERY = [_LS]
+    # SENSOR_DIRS = [Path('/home/server/pi/homes/truongmy/hudak_agb/LS')]
+    # SENSOR_YEARS = [range(2000, 2026)]
     
     with ThreadPoolExecutor(max_workers=PARALLELLISM) as ex:
         for position, (chips_path, years, collection) in enumerate(zip(SENSOR_DIRS, SENSOR_YEARS, IMAGERY)):

@@ -6,9 +6,10 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from download import  DIRS_YEARS, IMAGERY_DIR, STAT_PATH, PRISM_ELEMENTS, CHIP_SIZE, EPSG_CODE
-from train import DEVICE, DTYPE, SDTYPE, PATCH_SIZE, NO_DATA, TOUT_DIR, PRISM_FILES, SOLUS_FILES, NO_DATA, L_SIZE, AttnSETRPUP
+from constants import  DIRS_YEARS, IMAGERY_DIR, STAT_PATH, PRISM_ELEMENTS, CHIP_SIZE, EPSG_CODE
+from constants import DEVICE, DTYPE, SDTYPE, PATCH_SIZE, NO_DATA, TOUT_DIR, PRISM_FILES, SOLUS_FILES, NO_DATA, L_SIZE, 
 from inference import proc_sample, chip_writer, GridUnitInfDataset
+from train import PrithviUPerNet, AttnSETRPUP
 from utils import cache_anc
 
 
