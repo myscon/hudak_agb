@@ -7,10 +7,7 @@ from pathlib import Path
 from rasterio.windows import from_bounds
 from tqdm import tqdm
 
-from inference import PLOT_GRID
-
-JOUT_DIR = Path("data/outputs/initial_attempt/val_rmse_202.2471_s09570_e1913/jouts")
-JITTER_DIR = Path("data/outputs/initial_attempt/val_rmse_202.2471_s09570_e1913/jitters")
+from constants import BUFF_GRID_PATH, TRAIN_OUT_DIR
 
 
 def process_year(year, jitter_paths, grid, profile, outpath):
@@ -53,12 +50,11 @@ def process_year(year, jitter_paths, grid, profile, outpath):
             src.close()
 
 
-def collate_jitters(outpath=JOUT_DIR, jitter_dir=JITTER_DIR, plot_grid=PLOT_GRID):
+def collate_jitters(outpath, jitter_dir, plot_grid=BUFF_GRID_PATH):
     outpath.mkdir(parents=True, exist_ok=True)
 
-    # jitter_paths = sorted(jitter_dir.glob('[0-9][0-9][0-9][0-9]'))
-    jitter_paths = [jitter_dir /f"{i:04d}" for i in range(33)]
-    years = [p.stem for p in jitter_paths[0].glob("*.tif") if int(p.stem) == 2016]
+    jitter_paths = sorted(jitter_dir.glob('[0-9][0-9][0-9][0-9]'))
+    years = [p.stem for p in jitter_paths[0].glob("*.tif")]
     grid = gpd.read_file(plot_grid)
     with rasterio.open(jitter_paths[0] / f"{years[0]}.tif") as src:
         profile = src.profile
@@ -72,4 +68,6 @@ def collate_jitters(outpath=JOUT_DIR, jitter_dir=JITTER_DIR, plot_grid=PLOT_GRID
         
 
 if __name__ == "__main__":
-    collate_jitters()
+    jitter_dir = Path("/hudak_agb/data/outputs/upernet/val_rmse_231.0000_s09085_e1816/jitters")
+    collate_jitters(jitter_dir / "collated",
+                    jitter_dir)

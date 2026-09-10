@@ -28,7 +28,12 @@ TRAIN_OUT_DIR = DATA_DIR / 'outputs'
 UNITS_DIR = DATA_DIR / 'Forest_AGB_NW_USA_V2_2443/data/'
 UNITS_PATH = UNITS_DIR / 'Forest_AGB_NW_LidarUnits.zip'
 PLOTS_DIR = DATA_DIR / "plot_data"
-GRID_PLOTS_PATH = DATA_DIR / "hudak_agb_grid_invy.geojson"
+
+# different fishnets & subsets
+FISHNET_GRID = DATA_DIR / 'hudak_agb_grid.geojson' # for download and full inference
+PLOT_GRID_PATH = DATA_DIR / "hudak_agb_grid_invy.geojson" # inventory plots with years
+BUFF_GRID_PATH = DATA_DIR / 'hudak_agb_grid_buff.geojson' # buffered inventory plots w/o years
+CLIP_GRID_PATH = DATA_DIR / 'hudak_agb_grid_clip.geojson' # clipped for crop / avg
 
 # imagery directories
 SENSOR_DIRS = [DATA_DIR / 'LS', DATA_DIR / 'HLSL', DATA_DIR / 'HLSS', DATA_DIR / 'HLS', DATA_DIR / 'GLO30', DATA_DIR / 'NASADEM']
@@ -48,10 +53,6 @@ for e in PRISM_ELEMENTS:
     PRISM_FILES[e] = sorted(list(PRISM_RPR_DIR.glob(f"*{e}*.tif")))
 SOLUS_FILES = sorted(list(SOLUS_DIR.glob(f"*.tif")))
 
-PLOT_GRID = DATA_DIR / 'hudak_agb_grid_buff.geojson'
-FISHNET_GRID = DATA_DIR / 'hudak_agb_grid.geojson'
-CLIP_GRID = DATA_DIR / 'hudak_agb_grid_clip.geojson'
-
 # downloading repo from huggingface w/ checkpoint and architecture code
 PRITHVI_DIR = snapshot_download(repo_id="ibm-nasa-geospatial/Prithvi-EO-2.0-300M")
 sys.path.append(PRITHVI_DIR)
@@ -68,8 +69,7 @@ TOP_CKPT = 4
 
 DEVICE = torch.device('cuda')
 DTYPE = torch.bfloat16
-CDTYPE = torch.cfloat
-NO_DATA = -9999.0
+NO_DATA = -1.0
 INF_NO_DATA = 65535
 
 GRID_SIZE = PIXEL_SIZE * CHIP_SIZE

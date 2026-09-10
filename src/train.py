@@ -1,4 +1,3 @@
-import argparse
 import comet_ml
 import copy
 import geopandas as gpd
@@ -7,17 +6,22 @@ import torch.nn.functional as F
 import json
 import yaml
 
-from neuralop.layers.fno_block import FNOBlocks
 from rasterio.windows import from_bounds
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torchinfo import summary
+from tqdm import tqdm
 from transformers import ViTConfig, ViTModel
 
-from constants import CF_PATH, GRID_PLOTS_PATH, IMAGERY_DIR, PLOTS_DIR, PRISM_FILES, SOLUS_FILES, UNITS_DIR, UNITS_PATH, STAT_PATH
-from constants import TRAIN_OUT_DIR, PT_PATH, TOP_CKPT
-from constants import DIRS_YEARS, PRISM_ELEMENTS, PRISM_YEARS
-from constants import CDTYPE, CHIP_SIZE, DEVICE, DTYPE, L_SIZE, NO_DATA, PATCH_SIZE, PIXEL_SIZE
+from constants import (
+    IMAGERY_DIR, PLOTS_DIR, UNITS_DIR, UNITS_PATH, STAT_PATH, TRAIN_OUT_DIR,
+    CF_PATH, PLOT_GRID_PATH, PT_PATH, TOP_CKPT,
+    PRISM_FILES, SOLUS_FILES,
+    DIRS_YEARS, PRISM_ELEMENTS, PRISM_YEARS,
+    CHIP_SIZE, PIXEL_SIZE, PATCH_SIZE, L_SIZE,
+    NO_DATA,
+    DEVICE, DTYPE,
+)
 
 from prithvi_mae import PrithviMAE
 from utils import crop_and_pad, random_box_crop, read_window, cache_anc
@@ -32,11 +36,7 @@ class MSELoss(torch.nn.Module):
     def forward(self, preds, target):
         if self.ignore_index is not None:
             valid_mask = target != self.ignore_index
-            print(preds[valid_mask], target[valid_mask])
-            print(preds[valid_mask][torch.isnan(preds[valid_mask])], target[valid_mask][torch.isnan(target[valid_mask])])
-            
             diff = preds[valid_mask] - target[valid_mask]
-            print(diff[torch.isnan(diff)])
             mse = torch.mean(diff ** 2)
             return mse, diff.shape[0]
         else:
@@ -46,52 +46,59 @@ class MSELoss(torch.nn.Module):
 
 
 class CachedUnitDataset(Dataset):
-    def __init__(self, source, dem, cache, imagery_dir):
+    def __init__(self, source, dem, cache, imagery_dir, l_size=L_SIZE):
         self.source = source
         self.dem = dem
         self._cache = bool(cache)
+        self._l_size = l_size
         
         self.imagery_dir = imagery_dir
         self.dem_file = self.imagery_dir.glob(f"{self.dem}.tif").__next__()
         self.prism_dat = cache["prism_dat"]
+        self.prism_su_dat = cache["prism_su_dat"]
         self.solus_dat = cache["solus_dat"]
         self.patch_transform = cache["patch_transform"]
     
-    def __get_cache__(self, chip_bounds, year):
+    def _get_cache(self, chip_bounds, year):
         win = from_bounds(*chip_bounds, self.patch_transform)
         col_off, row_off = int(win.col_off), int(win.row_off)
 
         out = {}
-        out["SOLUS100"] = crop_and_pad(self.solus_dat, col_off, row_off, L_SIZE, L_SIZE).clone()
+        out["SOLUS100"] = crop_and_pad(self.solus_dat, col_off, row_off, self._l_size, self._l_size)
         
-        ancp = []
+        p = []
+        p_su = []
         for e in PRISM_ELEMENTS:
             E = e.upper()
-            out[f"PRISM_{E}"] = crop_and_pad(self.prism_dat[E], col_off, row_off, L_SIZE, L_SIZE).clone()
-            Y = int((year-PRISM_YEARS[0])*12)
-            YM = slice(Y+6,Y+8)
-            ancp.append(torch.mean(out[f"PRISM_{E}"][YM], dim=0))
-        out["PRISM__"] = torch.stack(ancp)
+            Y = int(year-PRISM_YEARS[0])
+            p.append(crop_and_pad(self.prism_dat[E], col_off, row_off, self._l_size, self._l_size))
+            p_su.append(crop_and_pad(self.prism_su_dat[E][Y:Y+1], col_off, row_off, self._l_size, self._l_size))
+        out["PRISM"] = torch.concat(p)
+        out["PRISM_SU"] = torch.concat(p_su)
     
         return out
     
     def __getitem__(self, idx):
-        unit_path, bounds, year = self.get_path_bounds_year(idx)
+        unit_path, bounds, year = self._get_path_bounds_year(idx)
         
         out = {"YEAR": year}
         out["agb"] = read_window(unit_path, bounds, 1)
         out[self.source] = read_window(self.imagery_dir / f"{self.source}{year}.tif", bounds)
         out[self.dem] = read_window(self.dem_file, bounds, 1)
 
-        out.update(self.__get_cache__(bounds, year)) 
+        out.update(self._get_cache(bounds, year)) 
 
         return out
+
+    def _get_path_bounds_year(self, idx):
+        pass
 
 
 class LidarUnitTrainDataset(CachedUnitDataset):
     def __init__(self, source='LS', dem='NASADEM', cache={}, imagery_dir=IMAGERY_DIR,
                  units_dir=UNITS_DIR,
-                 units_path=UNITS_PATH):
+                 units_path=UNITS_PATH,
+                 box_crop=True):
         super().__init__(source=source, dem=dem, cache=cache, imagery_dir=imagery_dir)
         self.years = list(DIRS_YEARS[self.source])
         self.units = gpd.read_file(units_path)
@@ -101,7 +108,7 @@ class LidarUnitTrainDataset(CachedUnitDataset):
     def __len__(self):
         return len(self.units)
 
-    def get_path_bounds_year(self, idx):
+    def _get_path_bounds_year(self, idx):
         unit_path = self.unit_files[self.units.iloc[idx]['LidarUnit']]
         bounds = random_box_crop(self.units.iloc[idx].geometry, CHIP_SIZE*PIXEL_SIZE)
         year = int(self.units.iloc[idx]['LidarYear'])
@@ -111,7 +118,7 @@ class LidarUnitTrainDataset(CachedUnitDataset):
 
 class PlotValDataset(CachedUnitDataset):
     def __init__(self, source='LS', dem='NASADEM', cache={}, imagery_dir=IMAGERY_DIR,
-                 grid_plots_path=GRID_PLOTS_PATH,
+                 grid_plots_path=PLOT_GRID_PATH,
                  plots_dir=PLOTS_DIR):
         super().__init__(source=source, dem=dem, cache=cache, imagery_dir=imagery_dir)
         self.plots_dir = plots_dir
@@ -120,7 +127,7 @@ class PlotValDataset(CachedUnitDataset):
     def __len__(self):
         return len(self.grid_plots)
 
-    def get_path_bounds_year(self, idx):
+    def _get_path_bounds_year(self, idx):
         bounds = self.grid_plots.iloc[idx].geometry.bounds
         year = int(self.grid_plots.iloc[idx]['INV_YEAR'])
         unit_path = self.plots_dir / f"{self.grid_plots.iloc[idx]['fid']:05d}_{year}.tif"
@@ -144,61 +151,6 @@ class DoubleConv(torch.nn.Module):
 
     def forward(self, x):
         return self.double_conv(x)
-
-
-class FFTBlock(torch.nn.Module):
-    def __init__(self, n_modes=64, channels=360, bias=False):
-        super().__init__()
-        self.n_modes = n_modes
-        self.mlp = torch.nn.Conv2d(in_channels=n_modes, out_channels=channels, kernel_size=1, bias=bias).to(DEVICE, CDTYPE)
-        self.norm = torch.nn.Sequential(
-            torch.nn.BatchNorm2d(channels),
-            torch.nn.GELU()
-        )
-
-    def forward(self, x):  
-        _, T, _, _ = x.shape
-        TM = T // 2
-        
-        x = torch.fft.fftn(x, dim=-3)
-        x = torch.fft.fftshift(x, dim=-3)
-
-        x = x[:, TM-self.n_modes//2: TM+self.n_modes//2]
-        x = self.mlp(x)
-        x = torch.fft.ifftshift(x, dim=-3)
-        x = torch.fft.ifftn(x, dim=-3)
-        x = self.norm(x.real)
-
-        return x
-
-class PRISMEncoderBlock(torch.nn.Module):
-    def __init__(self, num_ftts=3, n_tmodes=64, tfno_channels=360, out_channels=64):
-        super().__init__()
-        self.tfno = torch.nn.ModuleList([FFTBlock(n_modes=n_tmodes, channels=tfno_channels) for _ in range(num_ftts)])
-        self.mlpnorm = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=tfno_channels, out_channels=out_channels, kernel_size=1, bias=False),
-            torch.nn.BatchNorm2d(out_channels),
-            torch.nn.GELU()
-            )
-        self.to(DEVICE) # necessary call due to complex floats and current version of cuda
-
-    def forward(self, x):
-        for tfno in self.tfno:
-            x = x + tfno(x)
-        x = self.mlpnorm(x)
-        return x
-
-
-class SOLUSEncoderBlock(torch.nn.Module):
-    def __init__(self, channels=128, num_fnos=3, n_modes=16):
-        super().__init__()
-        self.sfno = FNOBlocks(n_modes=(n_modes, n_modes),
-                        in_channels=channels,
-                    out_channels=channels,
-                    n_layers=num_fnos)
-
-    def forward(self, x):
-        return self.sfno(x)
             
 
 class Upscaler(torch.nn.Module):
@@ -315,59 +267,26 @@ class AttnSETRPUP(torch.nn.Module):
         self.prithvi_mode = prithvi
         
         self.upscaler = Upscaler(embed_dim=self.embed_dim, depth=4)
-        if self.dem in self.ablate:
-            self.dem_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(1, 16, kernel_size=PATCH_SIZE, stride=PATCH_SIZE, bias=False),
+        self.dem_encoder = torch.nn.Sequential(
+                torch.nn.Conv2d(1, 64, kernel_size=PATCH_SIZE, stride=PATCH_SIZE, bias=False),
                 torch.nn.BatchNorm2d(16),
                 torch.nn.GELU(),
-                DoubleConv(in_channels=16, out_channels=16, mid_channels=64)
+                DoubleConv(in_channels=64, out_channels=64, mid_channels=64)
             )
-        else:
-            self.dem_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(1, 16, kernel_size=PATCH_SIZE, stride=PATCH_SIZE, bias=False),
-                torch.nn.BatchNorm2d(16),
-                torch.nn.GELU(),
-                FNOBlocks(n_modes=(16, 16),
-                        in_channels=16,
-                        out_channels=16,
-                        n_layers=3),
-            )
-        
-        if "SOLUS100" in self.ablate:
-            self.solus_encoder = DoubleConv(in_channels=128, out_channels=128, mid_channels=256)
-        else:
-            self.solus_encoder = SOLUSEncoderBlock()
-        
-        if "PRISM__" in self.ablate:
-            self.prism_encoder = DoubleConv(in_channels=len(PRISM_ELEMENTS), out_channels=len(PRISM_ELEMENTS), mid_channels=len(PRISM_ELEMENTS)*2)
-        else:
-            self.prism_encoder = FNOBlocks(n_modes=(16, 16),
-                        in_channels=len(PRISM_ELEMENTS),
-                        out_channels=len(PRISM_ELEMENTS),
-                        n_layers=num_prism_fnos)
-        
-        self.prism_encoders = {}
-        for p in PRISM_ELEMENTS:
-            name = f"PRISM_{p.upper()}"
-            if name in self.ablate:
-                self.prism_encoders[name] = DoubleConv(in_channels=360, out_channels=64, mid_channels=512)
-            else:
-                self.prism_encoders[name] = PRISMEncoderBlock()
-        self.prism_encoders = torch.nn.ModuleDict(self.prism_encoders)
-        
-        C_anc = 16+128+((64+1)*len(PRISM_ELEMENTS)) 
+        self.prism_su_encoder = DoubleConv(in_channels=len(PRISM_ELEMENTS), out_channels=64, mid_channels=64)
+        self.prism_encoder = DoubleConv(in_channels=len(PRISM_ELEMENTS), out_channels=64, mid_channels=64)
+        self.solus_encoder = DoubleConv(in_channels=128, out_channels=128, mid_channels=256)
+
+        C_anc = 128+(64*3) 
         self.fusion = CrossAttentionFusion(C_latent=self.embed_dim, C_anc=C_anc)
         self.head = DoubleConv(self.embed_dim // 2**4, 1, mid_channels=self.embed_dim // 2**4, mid=False)
     
     def forward(self, x):
         anc = []
         anc.append(self.dem_encoder(x[self.dem]))
+        anc.append(self.prism_encoder(x["PRISM"]))
+        anc.append(self.prism_encoder(x["PRISM_SU"]))
         anc.append(self.solus_encoder(x["SOLUS100"]))
-        
-        for p in PRISM_ELEMENTS:
-            P = f"PRISM_{p.upper()}"
-            anc.append(self.prism_encoders[P](x[P]))
-        anc.append(self.prism_encoder(x["PRISM__"]))
         
         anc = torch.cat(anc, dim=1)
         if self.prithvi_mode == "vit":
@@ -512,20 +431,16 @@ class PrithviUPerNet(torch.nn.Module):
         self.input_layers_num = len(self.input_layers)
 
         self.dem_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(1, 16, kernel_size=PATCH_SIZE, stride=PATCH_SIZE, bias=False),
-                torch.nn.BatchNorm2d(16),
+                torch.nn.Conv2d(1, 64, kernel_size=PATCH_SIZE, stride=PATCH_SIZE, bias=False),
+                torch.nn.BatchNorm2d(64),
                 torch.nn.GELU(),
-                DoubleConv(in_channels=16, out_channels=16, mid_channels=64)
+                DoubleConv(in_channels=64, out_channels=64, mid_channels=64)
             )
-        self.prism_encoder = DoubleConv(in_channels=len(PRISM_ELEMENTS), out_channels=len(PRISM_ELEMENTS), mid_channels=len(PRISM_ELEMENTS)*2)
-        self.prism_encoders = {}
-        for p in PRISM_ELEMENTS:
-            name = f"PRISM_{p.upper()}"
-            self.prism_encoders[name] = DoubleConv(in_channels=360, out_channels=64, mid_channels=512)
-        self.prism_encoders = torch.nn.ModuleDict(self.prism_encoders)
+        self.prism_encoder = DoubleConv(in_channels=len(PRISM_ELEMENTS), out_channels=64, mid_channels=64)
+        self.prism_su_encoder = DoubleConv(in_channels=len(PRISM_ELEMENTS), out_channels=64, mid_channels=64)
         self.solus_encoder = DoubleConv(in_channels=128, out_channels=128, mid_channels=256)
         
-        C_anc = 16+128+((64+1)*len(PRISM_ELEMENTS))
+        C_anc = 128+(64*3) 
         self.fusion = torch.nn.ModuleList([CrossAttentionFusion(C_latent=self.embed_dim, C_anc=C_anc) for _ in range(self.input_layers_num)])
 
         self.in_channels = [self.embed_dim * feature_multiplier for _ in self.input_layers]
@@ -640,12 +555,9 @@ class PrithviUPerNet(torch.nn.Module):
 
         anc = []
         anc.append(self.dem_encoder(x[self.dem]))
+        anc.append(self.prism_encoder(x["PRISM"]))
+        anc.append(self.prism_su_encoder(x["PRISM_SU"]))
         anc.append(self.solus_encoder(x["SOLUS100"]))
-        
-        for p in PRISM_ELEMENTS:
-            P = f"PRISM_{p.upper()}"
-            anc.append(self.prism_encoders[P](x[P]))
-        anc.append(self.prism_encoder(x["PRISM__"]))
         anc = torch.cat(anc, dim=1)
         
         anc_feats = []
@@ -671,20 +583,25 @@ def save_model(model, path, kwargs):
 def proc_sample(samples, stats, config):
     procs = {}
     for k, sample in samples.items():
-        if k != "YEAR":
+        if k != "YEAR" and k != "GRID_IDX":
             sample = sample.to(DEVICE, DTYPE)
             if k != 'agb':
                 if 'LS' in k and config['norm']:
-                    sample = (sample - stats[f"MEANS_PRITHVI"]) / stats[f"STDDV_PRITHVI"]
-                if k == 'PRISM__':
+                    means = stats[f"MEANS_PRITHVI"]
+                    stddv = stats[f"STDDV_PRITHVI"]
+                    sample = (sample - means) / stddv
+                if "PRISM" in k:
                     for i, p in enumerate(PRISM_ELEMENTS):
                         P = p.upper()
-                        sample[:,i:i+1] = (sample[:,i:i+1] - stats[f"MEANS_PRISM_{P}"]) / stats[f"STDDV_PRISM_{P}"]
+                        means = stats[f"MEANS_PRISM_{P}"]
+                        stddv = stats[f"STDDV_PRISM_{P}"]
+                        sample[:,i:i+1] = (sample[:,i:i+1] - means) / stddv
                 else:
-                    sample = (sample - stats[f"MEANS_{k}"]) / stats[f"STDDV_{k}"]
+                    means = stats[f"MEANS_{k}"]
+                    stddv = stats[f"STDDV_{k}"]
+                    sample = (sample - means) / stddv
             sample[torch.isnan(sample)] = NO_DATA
         procs[k] = sample
-    
     return procs
 
 
@@ -711,10 +628,12 @@ def main(config):
     _PROB_DIR.mkdir(exist_ok=True)
 
     # instantiating model and optimizers
-    # kwargs = {"img": config['img'], "dem": config['dem'], "prithvi": config['prithvi'], "ablate": config['ablate'], "norm": config["norm"]}
-    # model = AttnSETRPUP(**kwargs)
-    kwargs = {"img": config['img'], "dem": config['dem'], "norm": config["norm"]}
-    model = PrithviUPerNet(**kwargs)
+    if 'upernet' in config["name"]:
+        kwargs = {"img": config['img'], "dem": config['dem'], "norm": config["norm"]}
+        model = PrithviUPerNet(**kwargs)
+    else:
+        kwargs = {"img": config['img'], "dem": config['dem'], "prithvi": config['prithvi'], "ablate": config['ablate'], "norm": config["norm"]}
+        model = AttnSETRPUP(**kwargs)
     model.to(DEVICE, DTYPE)
     
     ran_input = ({
@@ -722,8 +641,8 @@ def main(config):
         config['img']: torch.randn(2, 6, 224, 224, device=DEVICE, dtype=DTYPE),
         config['dem']: torch.randn(2, 1, 224, 224, device=DEVICE, dtype=DTYPE),
         "SOLUS100": torch.randn(2, 128, 14, 14, device=DEVICE, dtype=DTYPE),
-        **{f"PRISM_{p.upper()}": torch.randn(2, 360, 14, 14, device=DEVICE, dtype=DTYPE) for p in PRISM_ELEMENTS},
-        "PRISM__": torch.randn(2,len(PRISM_ELEMENTS), 14, 14, device=DEVICE, dtype=DTYPE)
+        "PRISM": torch.randn(2, len(PRISM_ELEMENTS), 14, 14, device=DEVICE, dtype=DTYPE),
+        "PRISM_SU": torch.randn(2,len(PRISM_ELEMENTS), 14, 14, device=DEVICE, dtype=DTYPE)
     },)
     with torch.autocast(device_type="cuda", dtype=DTYPE):
         print(kwargs)
@@ -752,7 +671,7 @@ def main(config):
         model.train()
         train_rmse = 0
         train_weight = 0
-        for samples in train_loader:
+        for samples in tqdm(train_loader, desc=f"train epoch: {epoch}", leave=False):
             procs = proc_sample(samples, stats, config)
             optimizer.zero_grad()
             with torch.autocast(device_type="cuda", dtype=DTYPE):
@@ -774,7 +693,7 @@ def main(config):
         val_rmse = 0
         val_weight = 0
         with torch.no_grad():
-            for samples in val_loader:
+            for samples in tqdm(val_loader, desc=f"val epoch: {epoch}", leave=False):
                 procs = proc_sample(samples, stats, config)
                 with torch.autocast(device_type="cuda", dtype=DTYPE):
                     pred = model(procs)
@@ -806,12 +725,7 @@ def main(config):
     EXP.end()
     
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("idx", type=int)
-    # args = parser.parse_args()
-    
-    # hardcoding experiments
-    # i could do a yaml file but alas
+    # I could do a yaml file but alas
     config = {  "name": 'upernet',
                 "num_epochs": 2048,
                 "batch_size": 32,
@@ -819,12 +733,11 @@ if __name__ == "__main__":
                 "chck_int": 1,
                 "img": "LS",
                 "dem": "NASADEM",
-                "prithvi": "frozen",
+                "prithvi": "unfrozen",
                 "norm": False}
-    # ablates = [
-    #     (['NASADEM', 'SOLUS100', 'PRISM__'], "initial_attempt"),
-    #     (['NASADEM', 'SOLUS100', 'PRISM__', *[f"PRISM_{p.upper()}" for p in PRISM_ELEMENTS]], "initial_attempt_notfno")
-    # ]
+    
+    # removing ablations since they are no longer necessary for the paper story
+    # # hardcoding experiments
     # prithvis = ['frozen', 'frozen_pe', 'unfrozen', 'random', 'conv', 'vit']
     # configurations = [
     #     *[{"name": n, "ablate": a} for a, n in ablates],
@@ -833,6 +746,6 @@ if __name__ == "__main__":
     #     {"name": "prithvi_norm_pe", "ablate": ablates[0][0], "norm": True, "prithvi": "frozen_pe"}
     # ]
     # assert args.idx > -1 and args.idx < len(configurations)
-
     # config.update(configurations[args.idx])
+    
     main(config)

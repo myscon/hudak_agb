@@ -11,16 +11,22 @@ import zipfile
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
+from pathlib import Path
 from rasterio.windows import from_bounds as win_from_bounds
 from rasterio.transform import from_bounds as tran_from_bounds
 from rasterio.io import MemoryFile
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from urllib.parse import urljoin
 
-from constants import EE_PROJECT, EPSG_CODE, CHIP_SIZE, PARALLELLISM, PIXEL_SIZE, SCALE
-from constants import FISHNET_GRID, IMAGERY_DIR, PRISM_RPR_DIR, PRISM_ZIP_DIR, SOLUS_DIR, STAT_PATH
-from constants import SENSOR_DIRS, SENSOR_YEARS, PRISM_ELEMENTS, PRISM_YEARS
-from constants import COMPOSITE_DATE_START, COMPOSITE_DATE_END, LBANDS, SBANDS, BANDS
+from constants import (
+    EE_PROJECT, EPSG_CODE, PARALLELLISM, SCALE,
+    CHIP_SIZE, PIXEL_SIZE, FISHNET_GRID,
+    IMAGERY_DIR, PRISM_RPR_DIR, PRISM_ZIP_DIR, SOLUS_DIR, STAT_PATH,
+    SENSOR_DIRS, SENSOR_YEARS,
+    PRISM_ELEMENTS, PRISM_YEARS,
+    COMPOSITE_DATE_START, COMPOSITE_DATE_END,
+    LBANDS, SBANDS, BANDS,
+)
 
 
 ee.Initialize(project=EE_PROJECT)
@@ -29,7 +35,9 @@ ee.Initialize(project=EE_PROJECT)
 def get_ls_combined_sr_collection():
     lt5 = get_ls_sr_collection('LT05')
     le7 = get_ls_sr_collection('LE07')
-    # SLC-OFF for Landsat 7 after 2003-05-31
+    # remove SLC-OFF for Landsat 7 after 2003-05-31 but before 2012 
+    # to avoid discontinuity in time series before LC08
+    # no gap filling is done w/ LandTrendr
     le7 = le7.filter(ee.Filter.And([
         ee.Filter.Or([ee.Filter.lte('system:time_start', 1054425600000),
                       ee.Filter.gte('system:time_start', 1336176000000)]),
@@ -334,17 +342,19 @@ def main():
     fuse_futures = []
 
     _LS = get_ls_combined_sr_collection()
-    _HLSL = get_hls_sr_collection("HLSL30")
-    _HLSS = get_hls_sr_collection("HLSS30")
-    _HLS = get_hls_combined_sr_collection()
-    _GLO30 = ee.ImageCollection('COPERNICUS/DEM/GLO30').mosaic()
-    _NASADEM = ee.Image("NASA/NASADEM_HGT/001")
 
-    IMAGERY = [_LS, _HLSL, _HLSS, _HLS, _GLO30, _NASADEM] 
+    # only LS was included in the paper. keeping these here for later reference
+    # _HLSL = get_hls_sr_collection("HLSL30")
+    # _HLSS = get_hls_sr_collection("HLSS30")
+    # _HLS = get_hls_combined_sr_collection()
+    # _GLO30 = ee.ImageCollection('COPERNICUS/DEM/GLO30').mosaic()
+    # _NASADEM = ee.Image("NASA/NASADEM_HGT/001")
+    # IMAGERY = [_LS, _HLSL, _HLSS, _HLS, _GLO30, _NASADEM] 
     
-    # IMAGERY = [_LS]
-    # SENSOR_DIRS = [Path('/home/server/pi/homes/truongmy/hudak_agb/LS')]
-    # SENSOR_YEARS = [range(2000, 2026)]
+        
+    IMAGERY = [_LS]
+    SENSOR_DIRS = [SENSOR_DIRS[0]]
+    SENSOR_YEARS = [range(2000, 2016)]
     
     with ThreadPoolExecutor(max_workers=PARALLELLISM) as ex:
         for position, (chips_path, years, collection) in enumerate(zip(SENSOR_DIRS, SENSOR_YEARS, IMAGERY)):
