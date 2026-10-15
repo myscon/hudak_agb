@@ -69,7 +69,7 @@ TOP_CKPT = 4
 
 DEVICE = torch.device('cuda')
 DTYPE = torch.bfloat16
-NO_DATA = -1.0
+NO_DATA = -3.0
 INF_NO_DATA = 65535
 
 GRID_SIZE = PIXEL_SIZE * CHIP_SIZE
